@@ -4,6 +4,8 @@ import sqlite3
 import argparse
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
+from sentence_transformers import SentenceTransformer
 
 def get_description_google_books(title: str, authors: str) -> str:
     encoded_title = urllib.parse.quote_plus(title)
@@ -44,7 +46,7 @@ def get_description_open_library(title: str, authors: str) -> str:
         print(f"Error fetching data from Open Library: {e}")
         return "No description found"
     
-def does_book_exist(cursor, title: str, authors: str):
+def does_book_exist(cursor: sqlite3.Cursor, title: str, authors: str) -> bool:
     cursor.execute("""
         SELECT COUNT(1)
         FROM books
@@ -53,12 +55,17 @@ def does_book_exist(cursor, title: str, authors: str):
 
     return bool(cursor.fetchone()[0])
     
-def update_books(cursor, filepath: str, generate_description: bool=False, get_description=get_description_google_books):
-    assert not generate_description or get_description is not None, "Description not included in input and get description method not provided"
+def update_books(
+        cursor: sqlite3.Cursor,
+        filepath: str, 
+        generate_description: bool=False, 
+        get_description: Callable[[str, str], str] = get_description_google_books, 
+        compute_embedding: bool=False, embedding_model: SentenceTransformer = None
+    ) -> None:
+    assert not compute_embedding or embedding_model is not None, "If you would like to use embeddings, make sure to provide embedding model"
 
     with open(filepath, "r") as csv_file:
         reader = csv.reader(csv_file)
-        next(reader) #skipping header
         for entry in reader:
             assert len(entry) >= 3, f'Need at least 3 elements per row, found: {len(entry)} elements: {entry}'
             title, authors, shelf_row = entry[0].strip(), entry[1].strip(), entry[2].strip()
@@ -72,7 +79,8 @@ def update_books(cursor, filepath: str, generate_description: bool=False, get_de
                 description = entry[3].strip() if len(entry) > 3 else 'No description found' 
 
             print(f"Adding title: {title} ~ authors: {authors} ~ shelf row: {shelf_row} ~ description: {description[:35]}")
-            cursor.execute(f"INSERT OR IGNORE INTO books(\"title\", \"authors\", \"shelf_row\", \"description\") VALUES(?, ?, ?, ?);", (title, authors, shelf_row, description))
+            embedding = embedding_model.encode(description).tobytes() if compute_embedding else None
+            cursor.execute(f"INSERT OR IGNORE INTO books(\"title\", \"authors\", \"shelf_row\", \"description\", \"embedding\") VALUES(?, ?, ?, ?, ?);", (title, authors, shelf_row, description, embedding))
             cursor.connection.commit()
             
 
@@ -87,15 +95,20 @@ if __name__ == '__main__':
         authors TEXT NOT NULL,
         shelf_row INTEGER NOT NULL,
         description TEXT,
+        embedding BLOB,
         UNIQUE(title, authors)
     );"""
     )
+
+    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
     parser = argparse.ArgumentParser(
                     prog='UpdateBooksDB',
-                    description='Updates the books database used by the program given a text file of name, authors, and row number for books to be added. See ./sample_books_*_description.csv for format of this list and the books considered in this project. Can submit lists with and without descriptions. If a list without a description is used, a description will be fetched using the passed in web api (google books by default).')
+            )
 
     parser.add_argument('filepath')
     parser.add_argument('--generate_description', action='store_true')
+    parser.add_argument('--compute_description_embedding', action='store_true')
     parser.add_argument('--library_api', choices=['google_books', 'open_library'], default='google_books')
     args = parser.parse_args()
 
@@ -104,5 +117,5 @@ if __name__ == '__main__':
         "open_library": get_description_open_library
     }
 
-    update_books(cursor, args.filepath, args.generate_description, arg_to_get_description[args.library_api])
+    update_books(cursor, args.filepath, args.generate_description, arg_to_get_description[args.library_api], args.compute_description_embedding, embedding_model)
     books_db.close()
