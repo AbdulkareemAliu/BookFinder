@@ -1,11 +1,11 @@
-import json
 import csv
+import json
 import sqlite3
 import argparse
 import urllib.parse
 import urllib.request
 
-def get_description_google_books(title, authors):
+def get_description_google_books(title: str, authors: str) -> str:
     encoded_title = urllib.parse.quote_plus(title)
     encoded_authors = urllib.parse.quote_plus(authors)
     url = f"https://www.googleapis.com/books/v1/volumes?q=title:{encoded_title}+inauthor:{encoded_authors}"
@@ -26,7 +26,7 @@ def get_description_google_books(title, authors):
         print(f"Error fetching data from Open Library: {e}")
         return "No description found"
     
-def get_description_open_library(title, authors):
+def get_description_open_library(title: str, authors: str) -> str:
     encoded_title = urllib.parse.quote_plus(title)
     encoded_authors = urllib.parse.quote_plus(authors)
     url = f"https://openlibrary.org/search.json?q=title:{encoded_title}+author:{encoded_authors}"
@@ -44,7 +44,7 @@ def get_description_open_library(title, authors):
         print(f"Error fetching data from Open Library: {e}")
         return "No description found"
     
-def does_book_exist(cursor, title, authors):
+def does_book_exist(cursor, title: str, authors: str):
     cursor.execute("""
         SELECT COUNT(1)
         FROM books
@@ -53,7 +53,7 @@ def does_book_exist(cursor, title, authors):
 
     return bool(cursor.fetchone()[0])
     
-def update_books(cursor, filepath, generate_description=False, get_description=get_description_google_books):
+def update_books(cursor, filepath: str, generate_description: bool=False, get_description=get_description_google_books):
     assert not generate_description or get_description is not None, "Description not included in input and get description method not provided"
 
     with open(filepath, "r") as csv_file:
@@ -61,7 +61,7 @@ def update_books(cursor, filepath, generate_description=False, get_description=g
         next(reader) #skipping header
         for entry in reader:
             assert len(entry) >= 3, f'Need at least 3 elements per row, found: {len(entry)} elements: {entry}'
-            title, authors, shelf_row = entry[0], entry[1], entry[2]
+            title, authors, shelf_row = entry[0].strip(), entry[1].strip(), entry[2].strip()
             if does_book_exist(cursor, title, authors):
                 print('skip')
                 continue
@@ -69,10 +69,10 @@ def update_books(cursor, filepath, generate_description=False, get_description=g
             if generate_description:
                 description = get_description(title, authors)
             else:
-                description = entry[3] if len(entry) > 3 else 'No description found' 
+                description = entry[3].strip() if len(entry) > 3 else 'No description found' 
 
             print(f"Adding title: {title} ~ authors: {authors} ~ shelf row: {shelf_row} ~ description: {description[:35]}")
-            cursor.execute(f"INSERT OR IGNORE INTO books(\"title\", \"authors\", \"shelf_row\", \"book_description\") VALUES(?, ?, ?, ?);", (title, authors, shelf_row, description))
+            cursor.execute(f"INSERT OR IGNORE INTO books(\"title\", \"authors\", \"shelf_row\", \"description\") VALUES(?, ?, ?, ?);", (title, authors, shelf_row, description))
             cursor.connection.commit()
             
 
@@ -86,7 +86,7 @@ if __name__ == '__main__':
         title TEXT NOT NULL,
         authors TEXT NOT NULL,
         shelf_row INTEGER NOT NULL,
-        book_description TEXT,
+        description TEXT,
         UNIQUE(title, authors)
     );"""
     )
@@ -105,3 +105,4 @@ if __name__ == '__main__':
     }
 
     update_books(cursor, args.filepath, args.generate_description, arg_to_get_description[args.library_api])
+    books_db.close()
