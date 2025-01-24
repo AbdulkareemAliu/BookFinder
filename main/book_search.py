@@ -11,36 +11,6 @@ class BookSearch:
 
     def cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray):
         return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
-        
-    def setup_fts(self) -> None:
-        self.cursor.executescript('''
-            CREATE VIRTUAL TABLE books_fts USING fts5(
-                title, authors, description
-            );
-                                  
-            INSERT INTO books_fts (rowid, title, authors, description)
-            SELECT id, title, authors, description FROM books;
-
-            CREATE TRIGGER books_ai AFTER INSERT ON books BEGIN
-                INSERT INTO books_fts(rowid, title, authors, description)
-                VALUES (new.id, new.title, new.authors, new.description);
-            END;
-
-            CREATE TRIGGER books_ad AFTER DELETE ON books BEGIN
-                DELETE FROM books_fts
-                WHERE rowid = old.id;
-            END;
-
-            CREATE TRIGGER books_au AFTER UPDATE ON books BEGIN
-                UPDATE books_fts
-                SET 
-                    title = new.title,
-                    authors = new.authors,
-                    description = new.description
-                WHERE rowid = new.id;
-            END;
-        ''')
-        self.connection.commit()
 
     def fts_search(self, query: str) -> List[Tuple]:
         sql = '''
@@ -52,21 +22,34 @@ class BookSearch:
         '''
         return self.cursor.execute(sql, (query,)).fetchall()
     
-    def embedding_search(self, query: str, embedding_model: SentenceTransformer, threshold: int = 0.3) -> List[Tuple]:
-        self.cursor.execute("SELECT title, authors, shelf_row, embedding FROM books")
+    def embedding_naive_search(
+            self, 
+            query: str, 
+            embedding_model: SentenceTransformer,
+            threshold: float = 0.3, 
+            title_weight: float = 0.5,
+            description_weight: float = 0.5
+    ) -> List[Tuple]:
+        self.cursor.execute("SELECT title, authors, shelf_row, title_embedding, description_embedding FROM books")
         rows = self.cursor.fetchall()
-        
-        query_embedding = embedding_model.encode(query)
+
+        query_embedding = embedding_model.encode(query, prompt_name="query")
 
         results = []
-        for title, authors, row_num, b_embedding in rows:
-            description_embedding = np.frombuffer(b_embedding, dtype=np.float32)
-            similarity = self.cosine_similarity(query_embedding, description_embedding)
-            if similarity < threshold:
+        for title, authors, row_num, title_embedding_data, description_embedding_data in rows:
+            if not title_embedding_data and not description_embedding_data:
                 continue
-            results.append((similarity, title, authors, row_num))
+        
+            title_embedding = np.frombuffer(title_embedding_data, dtype=np.float32) if title_embedding_data else np.array()
+            description_embedding = np.frombuffer(description_embedding_data, dtype=np.float32) if description_embedding_data else np.array()
 
-        return list(sorted(results))
+            title_similarity = self.cosine_similarity(query_embedding, title_embedding) if title_embedding_data else 0
+            description_similarity = self.cosine_similarity(query_embedding, description_embedding) if description_embedding_data else 0
+            similarity = title_weight * title_similarity + description_weight * description_similarity
+            if similarity >= threshold:
+                results.append((similarity, title_similarity, description_similarity, title, authors, row_num))
+
+        return list(sorted(results, reverse=True))[:10]
 
     def close(self) -> None:
         self.connection.close()
@@ -76,26 +59,36 @@ if __name__ == '__main__':
                     prog='BookSearch'
             )
 
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+    # Run this if you do not have the model saved locally
+    # embedding_model = SentenceTransformer("Snowflake/snowflake-arctic-embed-m-v1.5")
+    # embedding_model.save("../models/snowflake-arctic-embed-m-v1.5")
+
+    embedding_model = SentenceTransformer("../models/finetuned-snowflake-arctic-embed-m-v1.5")
 
     parser.add_argument('query')
-    parser.add_argument('--search_method', choices=['fts', 'embedding'], default='embedding')
-    parser.add_argument('--initialize_fts', action='store_true')
+    parser.add_argument('--method', choices=['fts', 'embedding_naive'], default='embedding_naive')
     parser.add_argument('--similarity_threshold', default=0.3)
+    parser.add_argument('--title_weight', default=0.5)
+    parser.add_argument('--description_weight', default=0.5)
 
     args = parser.parse_args()
 
     searcher = BookSearch("../books-database/books.db")
-    if args.initialize_fts:
-        searcher.setup_fts()
 
-    match args.search_method:
+    match args.method:
         case "fts":
             result = searcher.fts_search(args.query)
-        case "embedding":
-            result = searcher.embedding_search(args.query, embedding_model, args.similarity_threshold)
+        case "embedding_naive":
+            result = searcher.embedding_naive_search(
+                args.query, 
+                embedding_model, 
+                float(args.similarity_threshold), 
+                float(args.title_weight), 
+                float(args.description_weight)
+            )
         case _:
             assert False
 
-
-    print(result)
+    print("Retrieved books: ")
+    for r in result:
+        print(r)

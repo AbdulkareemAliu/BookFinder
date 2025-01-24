@@ -25,7 +25,7 @@ def get_description_google_books(title: str, authors: str) -> str:
             
         assert False, f"Failed to make request for book - title: {title} and authors: {authors}"
     except urllib.error.URLError as e:
-        print(f"Error fetching data from Open Library: {e}")
+        print(f"Error fetching data from Google Books: {e}")
         return "No description found"
     
 def get_description_open_library(title: str, authors: str) -> str:
@@ -60,17 +60,16 @@ def update_books(
         filepath: str, 
         generate_description: bool=False, 
         get_description: Callable[[str, str], str] = get_description_google_books, 
-        compute_embedding: bool=False, embedding_model: SentenceTransformer = None
+        compute_embeddings: bool=False, embedding_model: SentenceTransformer = None
     ) -> None:
-    assert not compute_embedding or embedding_model is not None, "If you would like to use embeddings, make sure to provide embedding model"
+    assert not compute_embeddings or embedding_model is not None, "If you would like to use embeddings, make sure to provide embedding model"
 
     with open(filepath, "r") as csv_file:
         reader = csv.reader(csv_file)
         for entry in reader:
             assert len(entry) >= 3, f'Need at least 3 elements per row, found: {len(entry)} elements: {entry}'
-            title, authors, shelf_row = entry[0].strip(), entry[1].strip(), entry[2].strip()
+            title, authors, shelf_row = entry[0].strip().lower(), entry[1].strip().lower(), entry[2].strip().lower()
             if does_book_exist(cursor, title, authors):
-                print('skip')
                 continue
             
             if generate_description:
@@ -79,10 +78,50 @@ def update_books(
                 description = entry[3].strip() if len(entry) > 3 else 'No description found' 
 
             print(f"Adding title: {title} ~ authors: {authors} ~ shelf row: {shelf_row} ~ description: {description[:35]}")
-            embedding = embedding_model.encode(description).tobytes() if compute_embedding else None
-            cursor.execute(f"INSERT OR IGNORE INTO books(\"title\", \"authors\", \"shelf_row\", \"description\", \"embedding\") VALUES(?, ?, ?, ?, ?);", (title, authors, shelf_row, description, embedding))
+            title_embedding = embedding_model.encode(title + "; author: " + authors).tobytes() if compute_embeddings else None
+            description_embedding = embedding_model.encode(description).tobytes() if compute_embeddings and description else None
+            insert_query = """INSERT OR IGNORE
+                INTO books(
+                    \"title\",
+                    \"authors\",
+                    \"shelf_row\",
+                    \"description\",
+                    \"title_embedding\",
+                    \"description_embedding\"
+                ) VALUES(?, ?, ?, ?, ?, ?);
+            """
+            cursor.execute(insert_query, (title, authors, shelf_row, description, title_embedding, description_embedding))
             cursor.connection.commit()
             
+def initialize_fts(cursor: sqlite3.Cursor) -> None:
+    cursor.executescript('''
+        CREATE VIRTUAL TABLE books_fts USING fts5(
+            title, authors, description
+        );
+                                
+        INSERT INTO books_fts (rowid, title, authors, description)
+        SELECT id, title, authors, description FROM books;
+
+        CREATE TRIGGER books_ai AFTER INSERT ON books BEGIN
+            INSERT INTO books_fts(rowid, title, authors, description)
+            VALUES (new.id, new.title, new.authors, new.description);
+        END;
+
+        CREATE TRIGGER books_ad AFTER DELETE ON books BEGIN
+            DELETE FROM books_fts
+            WHERE rowid = old.id;
+        END;
+
+        CREATE TRIGGER books_au AFTER UPDATE ON books BEGIN
+            UPDATE books_fts
+            SET 
+                title = new.title,
+                authors = new.authors,
+                description = new.description
+            WHERE rowid = new.id;
+        END;
+    ''')
+    cursor.connection.commit()
 
 if __name__ == '__main__':
     books_db = sqlite3.connect("books.db")
@@ -95,12 +134,17 @@ if __name__ == '__main__':
         authors TEXT NOT NULL,
         shelf_row INTEGER NOT NULL,
         description TEXT,
-        embedding BLOB,
+        title_embedding BLOB,
+        description_embedding BLOB,
         UNIQUE(title, authors)
     );"""
     )
 
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+    # Run this if you do not have the model saved locally
+    # embedding_model = SentenceTransformer("Snowflake/snowflake-arctic-embed-m-v1.5")
+    # embedding_model.save("../models/snowflake-arctic-embed-m-v1.5")
+
+    embedding_model = SentenceTransformer("../models/finetuned-snowflake-arctic-embed-m-v1.5")
 
     parser = argparse.ArgumentParser(
                     prog='UpdateBooksDB',
@@ -108,7 +152,8 @@ if __name__ == '__main__':
 
     parser.add_argument('filepath')
     parser.add_argument('--generate_description', action='store_true')
-    parser.add_argument('--compute_description_embedding', action='store_true')
+    parser.add_argument('--compute_embeddings', action='store_true')
+    parser.add_argument('--initialize_fts', action='store_true')
     parser.add_argument('--library_api', choices=['google_books', 'open_library'], default='google_books')
     args = parser.parse_args()
 
@@ -117,5 +162,9 @@ if __name__ == '__main__':
         "open_library": get_description_open_library
     }
 
-    update_books(cursor, args.filepath, args.generate_description, arg_to_get_description[args.library_api], args.compute_description_embedding, embedding_model)
+    update_books(cursor, args.filepath, args.generate_description, arg_to_get_description[args.library_api], args.compute_embeddings, embedding_model)
+
+    if (args.initialize_fts):
+        initialize_fts(cursor)
+
     books_db.close()
