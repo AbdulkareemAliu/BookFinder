@@ -18,7 +18,7 @@ def fts_search(cursor: sqlite3.Cursor, query: str) -> List[Tuple]:
     return cursor.execute(sql, (query,)).fetchall()
 
 def scan_rows(rows: List[Tuple], query_embedding: np.ndarray, threshold: float=0.3, k: int=10):
-
+    #todo implement concurrent version
     results = []
     for title, authors, row_num, b_embedding in rows:
         if not b_embedding:
@@ -83,6 +83,30 @@ def embedding_lsh_search(
     print(len(rows))
     return scan_rows(rows, query_embedding, threshold)
 
+def embedding_cluster_lsh_search(
+        cursor: sqlite3.Cursor, 
+        query: str, 
+        embedding_model: SentenceTransformer,
+        lsh: LSH,
+        threshold: float = 0.3,
+) -> List[Tuple]:
+    query_embedding = embedding_model.encode(query, prompt_name="query", normalize_embeddings=True)
+
+    #todo: compute these concurrently
+    hash_keys = lsh.get_hash_keys(cursor, query_embedding)
+    centroid_id = find_nearest_centroid(cursor, query_embedding)
+
+    search_query = f"""
+                    SELECT DISTINCT title, authors, shelf_row, embedding FROM books
+                    JOIN lsh_hash_keys ON books.book_id = lsh_hash_keys.book_id
+                    WHERE books.centroid_id = ? AND ({" OR ".join("lsh_hash_keys." + col_name + " = ?" for col_name in lsh.table_id_names)})
+                    """
+
+    cursor.execute(search_query, [centroid_id] + hash_keys)
+    rows = cursor.fetchall()
+    print(len(rows))
+    return scan_rows(rows, query_embedding, threshold)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
                     prog='BookSearch'
@@ -99,12 +123,13 @@ if __name__ == '__main__':
 
     parser.add_argument('query')
     parser.add_argument('--method', choices=[
-        'fts', 'embedding_naive', 'embedding_cluster', 'embedding_lsh'
+        'fts', 'embedding_naive', 'embedding_cluster', 'embedding_lsh', 'embedding_cluster_lsh'
     ], default='embedding_naive')
     parser.add_argument('--similarity_threshold', default=0.3)
 
     lsh = LSH()
     args = parser.parse_args()
+    start = time.time()
     match args.method:
         case "fts":
             result = fts_search(cursor, args.query)
@@ -130,8 +155,18 @@ if __name__ == '__main__':
                 lsh,
                 float(args.similarity_threshold)
             )
+        case "embedding_cluster_lsh":
+            result = embedding_cluster_lsh_search(
+                cursor,
+                args.query, 
+                embedding_model, 
+                lsh,
+                float(args.similarity_threshold)
+            )
         case _:
             assert False
+    end = time.time()
+    print(f"Time to retrieve: {end - start}")
     for r in result:
         print(r)
 
