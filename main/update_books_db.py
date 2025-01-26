@@ -2,10 +2,12 @@ import csv
 import json
 import sqlite3
 import argparse
+import numpy as np
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from sentence_transformers import SentenceTransformer
+from cluster_embeddings import are_books_clustered, find_nearest_centroid, cluster
 
 def get_description_google_books(title: str, authors: str) -> str:
     encoded_title = urllib.parse.quote_plus(title)
@@ -60,7 +62,9 @@ def update_books(
         filepath: str, 
         generate_description: bool=False, 
         get_description: Callable[[str, str], str] = get_description_google_books, 
-        compute_embeddings: bool=False, embedding_model: SentenceTransformer = None
+        compute_embeddings: bool=False, 
+        embedding_model: SentenceTransformer = None,
+        recluster_embeddings: bool=False
     ) -> None:
     assert not compute_embeddings or embedding_model is not None, "If you would like to use embeddings, make sure to provide embedding model"
 
@@ -78,19 +82,31 @@ def update_books(
                 description = entry[3].strip() if len(entry) > 3 else 'No description found' 
 
             print(f"Adding title: {title} ~ authors: {authors} ~ shelf row: {shelf_row} ~ description: {description[:35]}")
-            title_embedding = embedding_model.encode(title + "; author: " + authors).tobytes() if compute_embeddings else None
-            description_embedding = embedding_model.encode(description).tobytes() if compute_embeddings and description else None
+            centroid_id = -1
+            if compute_embeddings:
+                embedding = embedding_model.encode(title + "; author: " + authors) + embedding_model.encode(description)
+
+                # will only assign embedding cluster id if there exists a cluster table and we do not plan to recluster
+                if not recluster_embeddings and are_books_clustered(cursor):
+                    centroid_id = find_nearest_centroid(cursor, embedding)
+
+                embedding = embedding.tobytes()
+
+            else:
+                embedding = None
+            
             insert_query = """INSERT OR IGNORE
                 INTO books(
                     \"title\",
                     \"authors\",
                     \"shelf_row\",
                     \"description\",
-                    \"title_embedding\",
-                    \"description_embedding\"
+                    \"embedding\",
+                    centroid_id
                 ) VALUES(?, ?, ?, ?, ?, ?);
             """
-            cursor.execute(insert_query, (title, authors, shelf_row, description, title_embedding, description_embedding))
+
+            cursor.execute(insert_query, (title, authors, shelf_row, description, embedding, centroid_id))
             cursor.connection.commit()
             
 def initialize_fts(cursor: sqlite3.Cursor) -> None:
@@ -124,7 +140,7 @@ def initialize_fts(cursor: sqlite3.Cursor) -> None:
     cursor.connection.commit()
 
 if __name__ == '__main__':
-    books_db = sqlite3.connect("books.db")
+    books_db = sqlite3.connect("../books-database/books.db")
     cursor = books_db.cursor()
 
     cursor.execute(
@@ -134,8 +150,8 @@ if __name__ == '__main__':
         authors TEXT NOT NULL,
         shelf_row INTEGER NOT NULL,
         description TEXT,
-        title_embedding BLOB,
-        description_embedding BLOB,
+        embedding BLOB,
+        centroid_id INTEGER,
         UNIQUE(title, authors)
     );"""
     )
@@ -153,6 +169,8 @@ if __name__ == '__main__':
     parser.add_argument('filepath')
     parser.add_argument('--generate_description', action='store_true')
     parser.add_argument('--compute_embeddings', action='store_true')
+    parser.add_argument('--quantize_embeddings', action='store_true')
+    parser.add_argument('--recluster_embeddings', action='store_true')
     parser.add_argument('--initialize_fts', action='store_true')
     parser.add_argument('--library_api', choices=['google_books', 'open_library'], default='google_books')
     args = parser.parse_args()
@@ -162,9 +180,20 @@ if __name__ == '__main__':
         "open_library": get_description_open_library
     }
 
-    update_books(cursor, args.filepath, args.generate_description, arg_to_get_description[args.library_api], args.compute_embeddings, embedding_model)
+    update_books(
+        cursor, 
+        args.filepath, 
+        args.generate_description, 
+        arg_to_get_description[args.library_api], 
+        args.compute_embeddings, 
+        embedding_model,
+        args.recluster_embeddings
+    )
 
     if (args.initialize_fts):
         initialize_fts(cursor)
+
+    if (args.recluster_embeddings):
+        cluster(cursor, 5)
 
     books_db.close()
