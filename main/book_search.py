@@ -3,14 +3,15 @@ import sqlite3
 import argparse
 import numpy as np
 from typing import List, Tuple
+from lsh_implementation import LSH
 from sentence_transformers import SentenceTransformer
 from cluster_embeddings import find_nearest_centroid, cosine_similarity
 
 def fts_search(cursor: sqlite3.Cursor, query: str) -> List[Tuple]:
     sql = '''
-    SELECT books.id, books.title, books.authors, books.shelf_row, books_fts.rank
+    SELECT books.book_id, books.title, books.authors, books.shelf_row, books_fts.rank
     FROM books
-    INNER JOIN books_fts ON books.id = books_fts.rowid
+    INNER JOIN books_fts ON books.book_id = books_fts.rowid
     WHERE books_fts.description MATCH ?
     ORDER BY rank
     '''
@@ -39,7 +40,7 @@ def embedding_naive_search(
 ) -> List[Tuple]:
     cursor.execute("SELECT title, authors, shelf_row, embedding FROM books")
     rows = cursor.fetchall()
-    query_embedding = embedding_model.encode(query, prompt_name="query")
+    query_embedding = embedding_model.encode(query, prompt_name="query", normalize_embeddings=True)
 
     return scan_rows(rows, query_embedding, threshold)
 
@@ -49,7 +50,7 @@ def embedding_cluster_search(
         embedding_model: SentenceTransformer,
         threshold: float = 0.3,
 ) -> List[Tuple]:
-    query_embedding = embedding_model.encode(query, prompt_name="query")
+    query_embedding = embedding_model.encode(query, prompt_name="query", normalize_embeddings=True)
     centroid_id = find_nearest_centroid(cursor, query_embedding)
 
     if centroid_id == -1:
@@ -58,6 +59,28 @@ def embedding_cluster_search(
 
     cursor.execute("SELECT title, authors, shelf_row, embedding FROM books WHERE centroid_id = ?", (centroid_id,))
     rows = cursor.fetchall()
+    print(len(rows))
+    return scan_rows(rows, query_embedding, threshold)
+
+def embedding_lsh_search(
+        cursor: sqlite3.Cursor, 
+        query: str, 
+        embedding_model: SentenceTransformer,
+        lsh: LSH,
+        threshold: float = 0.3,
+) -> List[Tuple]:
+    query_embedding = embedding_model.encode(query, prompt_name="query", normalize_embeddings=True)
+    hash_keys = lsh.get_hash_keys(cursor, query_embedding)
+
+    search_query = f"""
+                    SELECT DISTINCT title, authors, shelf_row, embedding FROM books 
+                    JOIN lsh_hash_keys ON books.book_id = lsh_hash_keys.book_id
+                    WHERE {" OR ".join("lsh_hash_keys." + col_name + " = ?" for col_name in lsh.table_id_names)}
+                    """
+
+    cursor.execute(search_query, hash_keys)
+    rows = cursor.fetchall()
+    print(len(rows))
     return scan_rows(rows, query_embedding, threshold)
 
 if __name__ == '__main__':
@@ -75,9 +98,12 @@ if __name__ == '__main__':
     embedding_model = SentenceTransformer("../models/finetuned-snowflake-arctic-embed-m-v1.5", cache_folder="./models/cache")
 
     parser.add_argument('query')
-    parser.add_argument('--method', choices=['fts', 'embedding_naive', 'embedding_cluster'], default='embedding_naive')
+    parser.add_argument('--method', choices=[
+        'fts', 'embedding_naive', 'embedding_cluster', 'embedding_lsh'
+    ], default='embedding_naive')
     parser.add_argument('--similarity_threshold', default=0.3)
 
+    lsh = LSH()
     args = parser.parse_args()
     match args.method:
         case "fts":
@@ -94,6 +120,14 @@ if __name__ == '__main__':
                 cursor,
                 args.query, 
                 embedding_model, 
+                float(args.similarity_threshold)
+            )
+        case "embedding_lsh":
+            result = embedding_lsh_search(
+                cursor,
+                args.query, 
+                embedding_model, 
+                lsh,
                 float(args.similarity_threshold)
             )
         case _:

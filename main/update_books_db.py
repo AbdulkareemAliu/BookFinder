@@ -5,6 +5,7 @@ import argparse
 import numpy as np
 import urllib.parse
 import urllib.request
+from lsh_implementation import LSH
 from collections.abc import Callable
 from sentence_transformers import SentenceTransformer
 from cluster_embeddings import are_books_clustered, find_nearest_centroid, cluster
@@ -64,13 +65,16 @@ def update_books(
         get_description: Callable[[str, str], str] = get_description_google_books, 
         compute_embeddings: bool=False, 
         embedding_model: SentenceTransformer = None,
-        recluster_embeddings: bool=False
+        recluster_embeddings: bool=False,
+        use_lsh: bool = False,
+        lsh: LSH = None
     ) -> None:
     assert not compute_embeddings or embedding_model is not None, "If you would like to use embeddings, make sure to provide embedding model"
+    assert not use_lsh or lsh is not None, "Must bass in lsh object if you would like to update with LSH"
 
     with open(filepath, "r") as csv_file:
         reader = csv.reader(csv_file)
-        for entry in reader:
+        for book_id, entry in enumerate(reader):
             assert len(entry) >= 3, f'Need at least 3 elements per row, found: {len(entry)} elements: {entry}'
             title, authors, shelf_row = entry[0].strip().lower(), entry[1].strip().lower(), entry[2].strip().lower()
             if does_book_exist(cursor, title, authors):
@@ -84,29 +88,33 @@ def update_books(
             print(f"Adding title: {title} ~ authors: {authors} ~ shelf row: {shelf_row} ~ description: {description[:35]}")
             centroid_id = -1
             if compute_embeddings:
-                embedding = embedding_model.encode(title + "; author: " + authors) + embedding_model.encode(description)
+                embedding = embedding_model.encode(title + "; author: " + authors, normalize_embeddings=True) + embedding_model.encode(description, normalize_embeddings=True)
 
                 # will only assign embedding cluster id if there exists a cluster table and we do not plan to recluster
                 if not recluster_embeddings and are_books_clustered(cursor):
                     centroid_id = find_nearest_centroid(cursor, embedding)
 
+                if use_lsh and lsh.is_lsh_initialized(cursor):
+                    lsh.update(cursor, book_id, embedding)
+
                 embedding = embedding.tobytes()
 
             else:
                 embedding = None
-            
+
             insert_query = """INSERT OR IGNORE
                 INTO books(
+                    \"book_id\",
                     \"title\",
                     \"authors\",
                     \"shelf_row\",
                     \"description\",
                     \"embedding\",
                     centroid_id
-                ) VALUES(?, ?, ?, ?, ?, ?);
+                ) VALUES(?, ?, ?, ?, ?, ?, ?);
             """
 
-            cursor.execute(insert_query, (title, authors, shelf_row, description, embedding, centroid_id))
+            cursor.execute(insert_query, (book_id, title, authors, shelf_row, description, embedding, centroid_id))
             cursor.connection.commit()
             
 def initialize_fts(cursor: sqlite3.Cursor) -> None:
@@ -116,16 +124,16 @@ def initialize_fts(cursor: sqlite3.Cursor) -> None:
         );
                                 
         INSERT INTO books_fts (rowid, title, authors, description)
-        SELECT id, title, authors, description FROM books;
+        SELECT book_id, title, authors, description FROM books;
 
         CREATE TRIGGER books_ai AFTER INSERT ON books BEGIN
             INSERT INTO books_fts(rowid, title, authors, description)
-            VALUES (new.id, new.title, new.authors, new.description);
+            VALUES (new.book_id, new.title, new.authors, new.description);
         END;
 
         CREATE TRIGGER books_ad AFTER DELETE ON books BEGIN
             DELETE FROM books_fts
-            WHERE rowid = old.id;
+            WHERE rowid = old.book_id;
         END;
 
         CREATE TRIGGER books_au AFTER UPDATE ON books BEGIN
@@ -134,7 +142,7 @@ def initialize_fts(cursor: sqlite3.Cursor) -> None:
                 title = new.title,
                 authors = new.authors,
                 description = new.description
-            WHERE rowid = new.id;
+            WHERE rowid = new.book_id;
         END;
     ''')
     cursor.connection.commit()
@@ -145,7 +153,7 @@ if __name__ == '__main__':
 
     cursor.execute(
         """CREATE TABLE IF NOT EXISTS books (
-        id INTEGER PRIMARY KEY,
+        book_id INTEGER PRIMARY KEY,
         title TEXT NOT NULL,
         authors TEXT NOT NULL,
         shelf_row INTEGER NOT NULL,
@@ -171,6 +179,7 @@ if __name__ == '__main__':
     parser.add_argument('--compute_embeddings', action='store_true')
     parser.add_argument('--quantize_embeddings', action='store_true')
     parser.add_argument('--recluster_embeddings', action='store_true')
+    parser.add_argument('--use_lsh', action='store_true')
     parser.add_argument('--initialize_fts', action='store_true')
     parser.add_argument('--library_api', choices=['google_books', 'open_library'], default='google_books')
     args = parser.parse_args()
@@ -180,6 +189,11 @@ if __name__ == '__main__':
         "open_library": get_description_open_library
     }
 
+    lsh = LSH()
+
+    if (args.use_lsh and not lsh.is_lsh_initialized(cursor)):
+        lsh.reset_tables(cursor, embedding_model.get_sentence_embedding_dimension())
+
     update_books(
         cursor, 
         args.filepath, 
@@ -187,7 +201,9 @@ if __name__ == '__main__':
         arg_to_get_description[args.library_api], 
         args.compute_embeddings, 
         embedding_model,
-        args.recluster_embeddings
+        args.recluster_embeddings,
+        args.use_lsh,
+        lsh
     )
 
     if (args.initialize_fts):

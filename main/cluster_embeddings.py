@@ -19,7 +19,7 @@ def cluster(cursor: sqlite3.Cursor, num_clusters):
     embeddings = []
     book_ids = []
 
-    cursor.execute("SELECT id, embedding FROM books")
+    cursor.execute("SELECT book_id, embedding FROM books")
     b_embeddings = cursor.fetchall()
     for id, b_embedding in b_embeddings:
         if not b_embedding:
@@ -32,11 +32,11 @@ def cluster(cursor: sqlite3.Cursor, num_clusters):
     centroids = kmeans.cluster_centers_
 
     for i, centroid in enumerate(centroids):
-        blob = centroid.astype(np.float32).tobytes()
-        cursor.execute("INSERT INTO book_centroids (centroid_id, centroid) VALUES (?, ?);", (i, blob))
+        b_centroid = centroid.astype(np.float32).tobytes()
+        cursor.execute("INSERT INTO book_centroids (centroid_id, centroid) VALUES (?, ?);", (i, b_centroid))
 
     for book_id, centroid_id in zip(book_ids, kmeans.labels_):
-        cursor.execute("UPDATE books SET centroid_id = ? WHERE id = ?;", (int(centroid_id), book_id))
+        cursor.execute("UPDATE books SET centroid_id = ? WHERE book_id = ?;", (int(centroid_id), book_id))
 
     cursor.connection.commit()
 
@@ -45,7 +45,7 @@ def are_books_clustered(cursor: sqlite3.Cursor) -> bool:
     SELECT name FROM sqlite_master WHERE type='table' AND name='book_centroids';
     """)
 
-    return bool(cursor.fetchone()[0])
+    return bool(cursor.fetchone())
 
 def find_nearest_centroid(cursor: sqlite3.Cursor, embedding: np.ndarray):
     if not are_books_clustered(cursor):
