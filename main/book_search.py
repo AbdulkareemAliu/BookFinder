@@ -129,66 +129,44 @@ if __name__ == '__main__':
     lsh = LSH()
     times = []
     args = parser.parse_args()
-    queries = [
-    'what are some books about politics',
-    'are there any books that explain how i can get a job',
-    'can you recommend books about the political and economic state of the world',
-    'i want to start a start up, what should i read',
-    'want to get into fashion, what do i read',
-    'want to learn more about the french revolution',
-    'i am interested in politics, where can i read about it and how it intersects with psychology',
-    'are there any fiction books about loss',
-    'want to read about time travel',
-    'where can i learn about philosophical interpretations of fate',
-    'what are some books you can recommend that will help me get into topology',
-    'how can i get into stochastic calculus',
-    'want to be come a quantitative researcher, how do i begin']
 
-    for query in queries:
-        if not args.quantize_embedding:
-            embedding = embedding_model.encode(query.lower())[:256]
-            embedding = embedding / np.linalg.norm(embedding)
-        else:
-            embedding = embedding_model.encode(query.lower(), precision = "int8", normalize_embeddings=True)
+    if not args.quantize_embedding:
+        embedding = embedding_model.encode(args.query.lower())[:256]
+        embedding = embedding / np.linalg.norm(embedding)
+    else:
+        embedding = embedding_model.encode(args.query.lower(), precision = "int8", normalize_embeddings=True)
 
-        start = time.time()
-        match args.method:
-            case "fts":
-                result = fts_search(cursor, query.lower().replace(",", ""))
-            case "embedding_naive":
-                result = embedding_naive_search(
-                    cursor,
-                    embedding,
-                    float(args.similarity_threshold)
-                )
-            case "embedding_cluster":
-                result = embedding_cluster_search(
-                    cursor,
-                    embedding,
-                    float(args.similarity_threshold)
-                )
-            case "embedding_lsh":
-                result = embedding_lsh_search(
-                    cursor,
-                    embedding,
-                    lsh,
-                    float(args.similarity_threshold)
-                )
-            case "embedding_cluster_lsh":
-                result = embedding_cluster_lsh_search(
-                    cursor,
-                    embedding,
-                    lsh,
-                    float(args.similarity_threshold)
-                )
-            case _:
-                assert False, 'Invalid method provided'
-        for r in result:
-            print(r)
-        print()
-        end = time.time()
-        times.append(round(end - start, 3))
-
-    print(f'avg({round(sum(times) / len(times), 3)}) times({times})')
-
+    match args.method:
+        case "fts":
+            result = fts_search(cursor, args.query.lower().replace(",", ""))
+        case "embedding_naive":
+            result = embedding_naive_search(
+                cursor,
+                embedding,
+                float(args.similarity_threshold)
+            )
+        case "embedding_cluster":
+            result = embedding_cluster_search(
+                cursor,
+                embedding,
+                float(args.similarity_threshold)
+            )
+        case "embedding_lsh":
+            result = embedding_lsh_search(
+                cursor,
+                embedding,
+                lsh,
+                float(args.similarity_threshold)
+            )
+        case "embedding_cluster_lsh":
+            result = embedding_cluster_lsh_search(
+                cursor,
+                embedding,
+                lsh,
+                float(args.similarity_threshold)
+            )
+        case _:
+            assert False, 'Invalid method provided'
+    for r in result:
+        print(r)
     books_db.close()
