@@ -30,7 +30,7 @@ def get_description_google_books(title: str, authors: str) -> str:
     except urllib.error.URLError as e:
         print(f"Error fetching data from Google Books: {e}")
         return "No description found"
-    
+
 def get_description_open_library(title: str, authors: str) -> str:
     encoded_title = urllib.parse.quote_plus(title)
     encoded_authors = urllib.parse.quote_plus(authors)
@@ -67,7 +67,8 @@ def update_books(
         embedding_model: SentenceTransformer = None,
         recluster_embeddings: bool=False,
         use_lsh: bool = False,
-        lsh: LSH = None
+        lsh: LSH = None,
+        quantize_embeddings: bool = False
     ) -> None:
     assert not compute_embeddings or embedding_model is not None, "If you would like to use embeddings, make sure to provide embedding model"
     assert not use_lsh or lsh is not None, "Must bass in lsh object if you would like to update with LSH"
@@ -88,7 +89,17 @@ def update_books(
             print(f"Adding title: {title} ~ authors: {authors} ~ shelf row: {shelf_row} ~ description: {description[:35]}")
             centroid_id = -1
             if compute_embeddings:
-                embedding = embedding_model.encode(title + "; author: " + authors, normalize_embeddings=True) + embedding_model.encode(description, normalize_embeddings=True)
+                if not quantize_embeddings:
+                    embedding = (
+                        embedding_model.encode(title + "; author: " + authors) +
+                        embedding_model.encode(description)
+                    )[:256]
+                    embedding = embedding / np.linalg.norm(embedding)
+                else:
+                    embedding = (
+                        embedding_model.encode(title + "; author: " + authors, precision = "int8", normalize_embeddings=True) +
+                        embedding_model.encode(description, precision = "int8", normalize_embeddings=True)
+                    )
 
                 # will only assign embedding cluster id if there exists a cluster table and we do not plan to recluster
                 if not recluster_embeddings and are_books_clustered(cursor):
@@ -189,10 +200,10 @@ if __name__ == '__main__':
         "open_library": get_description_open_library
     }
 
-    lsh = LSH()
+    lsh = LSH(np.int8 if args.quantize_embeddings else np.float32)
 
     if (args.use_lsh and not lsh.is_lsh_initialized(cursor)):
-        lsh.reset_tables(cursor, embedding_model.get_sentence_embedding_dimension())
+        lsh.reset_tables(cursor, 256)
 
     update_books(
         cursor, 
@@ -203,7 +214,8 @@ if __name__ == '__main__':
         embedding_model,
         args.recluster_embeddings,
         args.use_lsh,
-        lsh
+        lsh,
+        args.quantize_embeddings
     )
 
     if (args.initialize_fts):

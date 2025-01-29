@@ -3,10 +3,10 @@ import numpy as np
 
 
 class LSH:
-    def __init__(self):
+    def __init__(self, embedding_type: np.dtype = np.float32):
         self.num_planes = 6
         self.num_tables = 8
-        self.plane_type = np.float32
+        self.plane_type = embedding_type
         self.table_id_names = tuple(f'table_{table_id}_hash_key' for table_id in range(self.num_tables))
 
     def reset_tables(self, cursor: sqlite3.Cursor, embedding_dimension):
@@ -36,14 +36,14 @@ class LSH:
             cursor.execute("INSERT INTO lsh_tables (table_id, hyperplanes) VALUES (?, ?);", (table_id, b_hyperplanes))
 
             cursor.execute(f"""
-                    ALTER TABLE lsh_hash_keys ADD COLUMN {table_id_name} TEXT;
+                    ALTER TABLE lsh_hash_keys ADD COLUMN {table_id_name} BLOB;
                     """)
 
         cursor.connection.commit()
 
     def _hash(self, vector, hyperplanes):
-        projections = np.dot(vector, hyperplanes.T)
-        return ''.join([str(int(p > 0)) for p in projections])
+        projections = vector @ hyperplanes.T
+        return np.packbits(projections > 0)
     
     def get_hash_keys(self, cursor, vector):
         """Returns hash key for each table used for LSH. Assumes that vector is one dimension."""
@@ -51,7 +51,7 @@ class LSH:
                 SELECT table_id, hyperplanes FROM lsh_tables;
                 """)
 
-        hash_keys = ["" for _ in range(self.num_tables)]
+        hash_keys = [b"" for _ in range(self.num_tables)]
         for table_id, b_hyperplanes in cursor.fetchall():
             hyperplanes = np.frombuffer(b_hyperplanes, dtype=self.plane_type).reshape((self.num_planes, vector.shape[0]))
             hash_keys[table_id] = self._hash(vector, hyperplanes)
