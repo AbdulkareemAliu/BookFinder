@@ -1,7 +1,7 @@
 # BookFinder
 Implemented vector search for books in a bookshelf based on their titles and descriptions. The title, authors, shelf position, description, and the embedding of each book is stored in an sqlite database. Also finetuned the snowflake-arctic-embed-m-v1.5 model to be more compatible with book data, and the relevant code is featured in main/finetune_embedding_model notebook. I intended for this system to be lightweight and able to be run on a raspberry pi.
 
-### main/update_books_db.csv 
+### main/update_books_db 
 Add to the database from a csv. If you do not have access to the description, you can pass in the --generate_description flag and the google books or open library api will be called to find one. You can pass in a variety of other flags to control which features of the system you would like to use, including and not limited to, embedding quantization, fts support, or k means clustering.
 
 ### Search Methods
