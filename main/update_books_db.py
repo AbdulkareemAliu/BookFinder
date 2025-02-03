@@ -5,11 +5,15 @@ import argparse
 import numpy as np
 import urllib.parse
 import urllib.request
+from typing import List
 from lsh_implementation import LSH
 from collections.abc import Callable
+from cluster_embeddings import Clusterer
 from sentence_transformers import SentenceTransformer
-from cluster_embeddings import are_books_clustered, find_nearest_centroid, cluster
+from sentence_transformers.quantization import quantize_embeddings as quantize
+from calibration_embeddings import get_calibration_embeddings
 
+COMPRESSED_LENGTH = 256
 def get_description_google_books(title: str, authors: str) -> str:
     encoded_title = urllib.parse.quote_plus(title)
     encoded_authors = urllib.parse.quote_plus(authors)
@@ -68,6 +72,8 @@ def update_books(
         recluster_embeddings: bool=False,
         use_lsh: bool = False,
         lsh: LSH = None,
+        clusterer: Clusterer = None,
+        calibration_embeddings: List[np.ndarray] = None,
         quantize_embeddings: bool = False
     ) -> None:
     assert not compute_embeddings or embedding_model is not None, "If you would like to use embeddings, make sure to provide embedding model"
@@ -93,20 +99,32 @@ def update_books(
                     embedding = (
                         embedding_model.encode(title + "; author: " + authors) +
                         embedding_model.encode(description)
-                    )[:256]
+                    )[:COMPRESSED_LENGTH]
                     embedding = embedding / np.linalg.norm(embedding)
                 else:
                     embedding = (
-                        embedding_model.encode(title + "; author: " + authors, precision = "int8", normalize_embeddings=True) +
-                        embedding_model.encode(description, precision = "int8", normalize_embeddings=True)
+                        embedding_model.encode(title + "; author: " + authors) +
+                        embedding_model.encode(description)
                     )
+                    embedding = quantize(embedding, 'int8', calibration_embeddings=calibration_embeddings)
+                    # embedding = (
+                    #     embedding_model.encode(
+                    #         title + "; author: " + authors
+                    #     ) +
+                    #     embedding_model.encode(
+                    #         description, 
+                    #         precision = "int8", 
+                    #         normalize_embeddings=True,
+                    #         calibration_embeddings=calibration_embeddings
+                    #     )
+                    # )
 
                 # will only assign embedding cluster id if there exists a cluster table and we do not plan to recluster
-                if not recluster_embeddings and are_books_clustered(cursor):
-                    centroid_id = find_nearest_centroid(cursor, embedding)
+                if not recluster_embeddings and clusterer.are_books_clustered():
+                    centroid_id = clusterer.find_nearest_centroid(embedding)
 
-                if use_lsh and lsh.is_lsh_initialized(cursor):
-                    lsh.update(cursor, book_id, embedding)
+                if use_lsh and lsh.is_lsh_initialized():
+                    lsh.update(book_id, embedding)
 
                 embedding = embedding.tobytes()
 
@@ -198,12 +216,25 @@ if __name__ == '__main__':
     arg_to_get_description = {
         "google_books": get_description_google_books,
         "open_library": get_description_open_library
-    }
+    }  
 
-    lsh = LSH(np.int8 if args.quantize_embeddings else np.float32)
+    if args.quantize_embeddings:
+        lsh = LSH(
+            embedding_dimension=embedding_model.get_sentence_embedding_dimension(), 
+            cursor=cursor
+        )
+        calibration_embeddings = get_calibration_embeddings(cursor)
+    else:
+        lsh = LSH(
+            embedding_dimension=COMPRESSED_LENGTH,
+            cursor=cursor
+        )
+        calibration_embeddings = []
 
-    if (args.use_lsh and not lsh.is_lsh_initialized(cursor)):
-        lsh.reset_tables(cursor, 256)
+    clusterer = Clusterer(cursor)
+
+    if (args.use_lsh and not lsh.is_lsh_initialized()):
+        lsh.reset_tables()
 
     update_books(
         cursor, 
@@ -215,6 +246,8 @@ if __name__ == '__main__':
         args.recluster_embeddings,
         args.use_lsh,
         lsh,
+        clusterer,
+        calibration_embeddings,
         args.quantize_embeddings
     )
 
@@ -222,6 +255,6 @@ if __name__ == '__main__':
         initialize_fts(cursor)
 
     if (args.recluster_embeddings):
-        cluster(cursor, 5)
+        clusterer.cluster(5, np.int8 if args.quantize_embeddings else np.float32)
 
     books_db.close()

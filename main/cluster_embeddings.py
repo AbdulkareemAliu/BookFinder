@@ -1,67 +1,95 @@
 import sqlite3
 import numpy as np
-from collections import Counter
+from typing import List
 from sklearn.cluster import KMeans
 
-def cluster(cursor: sqlite3.Cursor, num_clusters):
-    cursor.execute("""
-    DROP TABLE IF EXISTS book_centroids;
-    """)
+class Clusterer:
+    def __init__(self, cursor: sqlite3.Cursor=None, should_cache_centroids: bool = False):
+        if cursor is None:
+            books_db = sqlite3.connect("../books-database/books.db")
+            self.cursor = books_db.cursor()
+        else:
+            self.cursor = cursor
 
-    cursor.execute("""
-    CREATE TABLE book_centroids (
-        centroid_id INTEGER PRIMARY KEY,
-        centroid BLOB
-    );
-    """)
-    cursor.connection.commit()
+        self.should_cache_centroids = should_cache_centroids
+        self.cached_centroids = None
+        self.cached_ids = None
 
-    embeddings = []
-    book_ids = []
+    def cluster(self, num_clusters, embeddings_dtype):
+        self.cursor.execute("""
+        DROP TABLE IF EXISTS book_centroids;
+        """)
 
-    cursor.execute("SELECT book_id, embedding FROM books")
-    b_embeddings = cursor.fetchall()
-    for id, b_embedding in b_embeddings:
-        if not b_embedding:
-            continue
+        self.cursor.execute("""
+        CREATE TABLE book_centroids (
+            centroid_id INTEGER PRIMARY KEY,
+            centroid BLOB
+        );
+        """)
+        self.cursor.connection.commit()
 
-        book_ids.append(id)
-        embeddings.append(np.frombuffer(b_embedding, dtype=np.float32))
+        embeddings = []
+        book_ids = []
 
-    kmeans = KMeans(n_clusters=num_clusters).fit(embeddings)
-    centroids = kmeans.cluster_centers_
+        self.cursor.execute("SELECT book_id, embedding FROM books")
+        b_embeddings = self.cursor.fetchall()
+        for id, b_embedding in b_embeddings:
+            if not b_embedding:
+                continue
 
-    for i, centroid in enumerate(centroids):
-        centroid = centroid / np.linalg.norm(centroid)
-        b_centroid = centroid.astype(np.float32).tobytes()
-        cursor.execute("INSERT INTO book_centroids (centroid_id, centroid) VALUES (?, ?);", (i, b_centroid))
+            book_ids.append(id)
+            embeddings.append(np.frombuffer(b_embedding, dtype=embeddings_dtype).astype(np.float32))
 
-    for book_id, centroid_id in zip(book_ids, kmeans.labels_):
-        cursor.execute("UPDATE books SET centroid_id = ? WHERE book_id = ?;", (int(centroid_id), book_id))
+        kmeans = KMeans(n_clusters=num_clusters).fit(embeddings)
+        centroids = kmeans.cluster_centers_
 
-    cursor.connection.commit()
+        for i, centroid in enumerate(centroids):
+            centroid = (centroid / np.linalg.norm(centroid)).astype(np.float32)
+            b_centroid = centroid.tobytes()
+            self.cursor.execute("INSERT INTO book_centroids (centroid_id, centroid) VALUES (?, ?);", (i, b_centroid))
 
-def are_books_clustered(cursor: sqlite3.Cursor) -> bool:
-    cursor.execute("""
-    SELECT name FROM sqlite_master WHERE type='table' AND name='book_centroids';
-    """)
+        for book_id, centroid_id in zip(book_ids, kmeans.labels_):
+            self.cursor.execute("UPDATE books SET centroid_id = ? WHERE book_id = ?;", (int(centroid_id), book_id))
 
-    return bool(cursor.fetchone())
+        self.cursor.connection.commit()
 
-def find_nearest_centroid(cursor: sqlite3.Cursor, embedding: np.ndarray):
-    cursor.execute("SELECT centroid_id, centroid FROM book_centroids")
-    rows = cursor.fetchall()
-    if not rows: return -1
-    centroid_embeddings = np.array([np.frombuffer(row[1], dtype=embedding.dtype) if row else np.zeros_like(embedding) for row in rows])
-    return rows[np.argmax(embedding @ centroid_embeddings.T)][0]
+    def are_books_clustered(self) -> bool:
+        self.cursor.execute("""
+        SELECT name FROM sqlite_master WHERE type='table' AND name='book_centroids';
+        """)
 
-def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray):
-    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+        return bool(self.cursor.fetchone())
+    
+    def _cache(self, centroids: np.ndarray, ids: List[int]):
+        if not self.should_cache_centroids:
+            return
+        self.cached_centroids = centroids
+        self.cached_ids = ids
+
+
+    def find_nearest_centroid(self, embedding: np.ndarray):
+        if self.cached_centroids is None:
+            self.cursor.execute("SELECT centroid_id, centroid FROM book_centroids")
+            rows = self.cursor.fetchall()
+            if not rows: return -1
+            ids, b_embeddings = zip(*rows)
+
+            centroid_embeddings = np.array([
+                np.frombuffer(b_embedding, dtype=np.float32)
+                if b_embedding else np.zeros(embedding.shape)
+                for b_embedding in b_embeddings
+            ]).T
+
+            self._cache(centroid_embeddings, ids)
+        else:
+            ids = self.cached_ids
+            centroid_embeddings = self.cached_centroids
+
+        embedding /= np.linalg.norm(embedding) + 1e-6
+        scores = embedding @ centroid_embeddings
+
+        return ids[np.argmax(scores)]
 
 if __name__ == '__main__':
-    books_db = sqlite3.connect("../books-database/books.db")
-    cursor = books_db.cursor()
-
-    cluster(cursor, 5)
-
-    
+    clusterer = Clusterer()
+    clusterer.cluster(5, np.float32)

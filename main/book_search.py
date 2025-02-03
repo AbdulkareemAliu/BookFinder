@@ -4,120 +4,164 @@ import argparse
 import numpy as np
 from typing import List, Tuple
 from lsh_implementation import LSH
-from concurrent.futures import ThreadPoolExecutor
+from cluster_embeddings import Clusterer
 from sentence_transformers import SentenceTransformer
-from cluster_embeddings import find_nearest_centroid, cosine_similarity
+from calibration_embeddings import get_calibration_embeddings
+from sentence_transformers.quantization import quantize_embeddings as quantize
+class BookSearchHandler:
+    def __init__(
+            self,
+            search_method: str = "embedding_naive",
+            quantize_embeddings: bool = False,
+            similarity_threshold: float = 0.3,
+            books_db_path: str="../books-database/books.db",
+            embedding_model_path: str="../models/finetuned-snowflake-arctic-embed-m-v1.5",
+            model_cache_path: str="./models/cache"
+    ):
+        self.db = sqlite3.connect(books_db_path)
+        self.cursor = self.db.cursor()
+        self.embedding_model = SentenceTransformer(embedding_model_path, cache_folder=model_cache_path)
 
-def fts_search(cursor: sqlite3.Cursor, query: str) -> List[Tuple]:
-    sql = '''
-    SELECT books.book_id, books.title, books.authors, books.shelf_row, books_fts.rank
-    FROM books
-    INNER JOIN books_fts ON books.book_id = books_fts.rowid
-    WHERE books_fts.description MATCH ?
-    ORDER BY rank
-    '''
-    try:
-        return cursor.execute(sql, (query,)).fetchall()
-    except Exception:
-        return []
+        self.threshold = similarity_threshold
+        self.quantize_embeddings = quantize_embeddings
+        if quantize_embeddings:
+            self.calibration_embeddings = get_calibration_embeddings(self.cursor)
+            self.embedding_dimension = self.embedding_model.get_sentence_embedding_dimension()
+        else:
+            self.embedding_dimension = 256
 
-def scan_rows(rows: List[Tuple[str, str, int, bytearray]], query_embedding: np.ndarray, threshold: float=0.3):
-    embeddings = np.array([
-        np.frombuffer(b_embedding, dtype=query_embedding.dtype) if b_embedding else np.zeros_like(query_embedding)
-        for _, _, _, b_embedding in rows
-    ])
+        self.lsh = LSH(self.embedding_dimension, self.cursor)
+        self.clusterer = Clusterer(self.cursor, should_cache_centroids=True)
 
-    scores = query_embedding @ embeddings.T
-    above_threshold_indices = np.where(scores >= threshold)[0]
-    k = min(5, len(above_threshold_indices))
+        assert search_method in {'fts', 'embedding_naive', 'embedding_cluster', 'embedding_lsh', 'embedding_cluster_lsh'}, "Please enter valid search method"
+        self.method = search_method
 
-    above_threshold_scores = scores[above_threshold_indices]
-    top_k_indices = np.argpartition(above_threshold_scores, -k)[-k:]
-    top_k_indices = top_k_indices[np.argsort(-above_threshold_scores[top_k_indices])]
-    results = [
-        (scores[above_threshold_indices[i]], rows[above_threshold_indices[i]][0], 
-        rows[above_threshold_indices[i]][1], rows[above_threshold_indices[i]][2])
-        for i in top_k_indices
-    ]
+    def fts_search(self, query: str) -> List[Tuple]:
+        sql = '''
+        SELECT books.book_id, books.title, books.authors, books.shelf_row, books_fts.rank
+        FROM books
+        INNER JOIN books_fts ON books.book_id = books_fts.rowid
+        WHERE books_fts.description MATCH ?
+        ORDER BY rank
+        '''
+        try:
+            return self.cursor.execute(sql, (query,)).fetchall()
+        except Exception:
+            return []
 
-    return results
+    def scan_rows(
+            self, 
+            rows: List[Tuple[str, str, int, bytearray]], 
+            query_embedding: np.ndarray
+    ):
 
-def embedding_naive_search(
-        cursor: sqlite3.Cursor, 
-        query_embedding: np.ndarray, 
-        threshold: float = 0.3
-) -> List[Tuple]:
-    cursor.execute("SELECT title, authors, shelf_row, embedding FROM books")
-    rows = cursor.fetchall()
+        embedding_type = np.int8 if self.quantize_embeddings else np.float32
+        embeddings = np.array([
+            np.frombuffer(b_embedding, dtype=embedding_type) if b_embedding else np.zeros(query_embedding.shape)
+            for _, _, _, b_embedding in rows
+        ]).astype(query_embedding.dtype)
+        embeddings /= (np.linalg.norm(embeddings, axis=1, keepdims=True).astype(np.float32) + 1e-6)
 
-    return scan_rows(rows, query_embedding, threshold) if rows else []
+        scores = query_embedding @ embeddings.T
+        above_threshold_indices = np.where(scores >= self.threshold)[0]
+        k = min(5, len(above_threshold_indices))
 
-def embedding_cluster_search(
-        cursor: sqlite3.Cursor, 
-        query_embedding: np.ndarray, 
-        threshold: float = 0.3
-) -> List[Tuple]:
-    centroid_id = find_nearest_centroid(cursor, query_embedding)
+        above_threshold_scores = scores[above_threshold_indices]
+        top_k_indices = np.argpartition(above_threshold_scores, -k)[-k:]
+        top_k_indices = top_k_indices[np.argsort(-above_threshold_scores[top_k_indices])]
+        results = [
+            (scores[above_threshold_indices[i]], rows[above_threshold_indices[i]][0], 
+            rows[above_threshold_indices[i]][1], rows[above_threshold_indices[i]][2])
+            for i in top_k_indices
+        ]
 
-    if centroid_id == -1:
-        return embedding_naive_search(cursor, query_embedding, threshold)
+        return results
 
-    cursor.execute("SELECT title, authors, shelf_row, embedding FROM books WHERE centroid_id = ?", (centroid_id,))
-    rows = cursor.fetchall()
-    return scan_rows(rows, query_embedding, threshold) if rows else []
+    def embedding_naive_search(
+            self, 
+            query_embedding: np.ndarray,
+    ) -> List[Tuple]:
+        self.cursor.execute("SELECT title, authors, shelf_row, embedding FROM books")
+        rows = self.cursor.fetchall()
 
-def embedding_lsh_search(
-        cursor: sqlite3.Cursor, 
-        query_embedding: np.ndarray,
-        lsh: LSH,
-        threshold: float = 0.3
-) -> List[Tuple]:
-    hash_keys = lsh.get_hash_keys(cursor, query_embedding)
+        return self.scan_rows(rows, query_embedding) if rows else []
 
-    search_query = f"""
-                    SELECT DISTINCT title, authors, shelf_row, embedding FROM books 
-                    JOIN lsh_hash_keys ON books.book_id = lsh_hash_keys.book_id
-                    WHERE {" OR ".join("lsh_hash_keys." + col_name + " = ?" for col_name in lsh.table_id_names)}
-                    """
+    def embedding_cluster_search(
+            self, 
+            query_embedding: np.ndarray
+    ) -> List[Tuple]:
+        centroid_id = self.clusterer.find_nearest_centroid(query_embedding)
 
-    cursor.execute(search_query, hash_keys)
-    rows = cursor.fetchall()
+        if centroid_id == -1:
+            return self.embedding_naive_search(query_embedding)
 
-    return scan_rows(rows, query_embedding, threshold) if rows else []
+        self.cursor.execute("SELECT title, authors, shelf_row, embedding FROM books WHERE centroid_id = ?", (centroid_id,))
+        rows = self.cursor.fetchall()
+        return self.scan_rows(rows, query_embedding) if rows else []
 
-def embedding_cluster_lsh_search(
-        cursor: sqlite3.Cursor, 
-        query_embedding: np.ndarray, 
-        lsh: LSH,
-        threshold: float = 0.3
-) -> List[Tuple]:
-    hash_keys = lsh.get_hash_keys(cursor, query_embedding)
-    centroid_id = find_nearest_centroid(cursor, query_embedding)
+    def embedding_lsh_search(
+            self, 
+            query_embedding: np.ndarray
+    ) -> List[Tuple]:
+        hash_keys = self.lsh.get_hash_keys(query_embedding)
 
-    search_query = f"""
-                    SELECT DISTINCT title, authors, shelf_row, embedding FROM books
-                    JOIN lsh_hash_keys ON books.book_id = lsh_hash_keys.book_id
-                    WHERE books.centroid_id = ? OR ({" OR ".join("lsh_hash_keys." + col_name + " = ?" for col_name in lsh.table_id_names)})
-                    """
+        search_query = f"""
+                        SELECT DISTINCT title, authors, shelf_row, embedding FROM books 
+                        JOIN lsh_hash_keys ON books.book_id = lsh_hash_keys.book_id
+                        WHERE {" OR ".join("lsh_hash_keys." + col_name + " = ?" for col_name in self.lsh.table_id_names)}
+                        """
 
-    cursor.execute(search_query, [centroid_id] + hash_keys)
-    rows = cursor.fetchall()
+        self.cursor.execute(search_query, hash_keys)
+        rows = self.cursor.fetchall()
 
-    return scan_rows(rows, query_embedding, threshold) if rows else []
+        return self.scan_rows(rows, query_embedding) if rows else []
+
+    def embedding_cluster_lsh_search(
+            self, 
+            query_embedding: np.ndarray,
+    ) -> List[Tuple]:
+        hash_keys = self.lsh.get_hash_keys(query_embedding)
+        centroid_id = self.clusterer.find_nearest_centroid(query_embedding)
+
+        search_query = f"""
+                        SELECT DISTINCT title, authors, shelf_row, embedding FROM books
+                        JOIN lsh_hash_keys ON books.book_id = lsh_hash_keys.book_id
+                        WHERE books.centroid_id = ? AND ({" OR ".join("lsh_hash_keys." + col_name + " = ?" for col_name in self.lsh.table_id_names)})
+                        """
+
+        self.cursor.execute(search_query, [centroid_id] + hash_keys)
+        rows = self.cursor.fetchall()
+
+        return self.scan_rows(rows, query_embedding) if rows else []
+
+    def book_search(self, query: str):
+
+        if self.method == 'fts':
+            result = self.fts_search(query.lower().replace(",", ""))
+        else:
+            embedding = self.embedding_model.encode(query.lower())[:self.embedding_dimension]
+            if self.quantize_embeddings:
+                embedding = quantize(embedding, 'int8', calibration_embeddings=self.calibration_embeddings)
+                embedding = embedding.astype(np.float32) / np.linalg.norm(embedding).astype(np.float32)
+
+            match self.method:
+                case "embedding_naive":
+                    result = self.embedding_naive_search(embedding)
+                case "embedding_cluster":
+                    result = self.embedding_cluster_search(embedding)
+                case "embedding_lsh":
+                    result = self.embedding_lsh_search(embedding)
+                case "embedding_cluster_lsh":
+                    result = self.embedding_cluster_lsh_search(embedding)
+                case _:
+                    assert False, 'Invalid method provided'
+
+        return result
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
                     prog='BookSearch'
             )
-    
-    books_db = sqlite3.connect("../books-database/books.db")
-    cursor = books_db.cursor()
-
-    # Run this if you do not have the model saved locally
-    # embedding_model = SentenceTransformer("Snowflake/snowflake-arctic-embed-m-v1.5")
-    # embedding_model.save("../models/snowflake-arctic-embed-m-v1.5")
-
-    embedding_model = SentenceTransformer("../models/finetuned-snowflake-arctic-embed-m-v1.5", cache_folder="./models/cache")
 
     parser.add_argument('query')
     parser.add_argument('--method', choices=[
@@ -126,47 +170,14 @@ if __name__ == '__main__':
     parser.add_argument('--similarity_threshold', default=0.3)
     parser.add_argument('--quantize_embedding', action='store_true')
 
-    lsh = LSH()
-    times = []
     args = parser.parse_args()
 
-    if not args.quantize_embedding:
-        embedding = embedding_model.encode(args.query.lower())[:256]
-        embedding = embedding / np.linalg.norm(embedding)
-    else:
-        embedding = embedding_model.encode(args.query.lower(), precision = "int8", normalize_embeddings=True)
+    search_handler = BookSearchHandler(
+        search_method=args.method,
+        quantize_embeddings=args.quantize_embedding,
+        similarity_threshold=float(args.similarity_threshold)
+    )
 
-    match args.method:
-        case "fts":
-            result = fts_search(cursor, args.query.lower().replace(",", ""))
-        case "embedding_naive":
-            result = embedding_naive_search(
-                cursor,
-                embedding,
-                float(args.similarity_threshold)
-            )
-        case "embedding_cluster":
-            result = embedding_cluster_search(
-                cursor,
-                embedding,
-                float(args.similarity_threshold)
-            )
-        case "embedding_lsh":
-            result = embedding_lsh_search(
-                cursor,
-                embedding,
-                lsh,
-                float(args.similarity_threshold)
-            )
-        case "embedding_cluster_lsh":
-            result = embedding_cluster_lsh_search(
-                cursor,
-                embedding,
-                lsh,
-                float(args.similarity_threshold)
-            )
-        case _:
-            assert False, 'Invalid method provided'
+    result = search_handler.book_search(args.query)
     for r in result:
         print(r)
-    books_db.close()
