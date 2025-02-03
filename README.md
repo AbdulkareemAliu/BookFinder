@@ -17,3 +17,8 @@ The embedding model was finetuned using this dataset https://www.kaggle.com/data
 
 ### Query system
 main/book_search.py is a script that allows you to make queries through the terminal and main/main.py allows you to make queries with speech. Both systems allow you to specify the method you would like to make searches, the minimum similarity threshold needed in your results, and the maximum number of results to return.
+
+### Models
+The following models are used (you need to install them and add to models/ directory). 
+vosk-model-small-en-us-0.15 from https://alphacephei.com/vosk/models
+snowflake-arctic-embed-m-v1.5 from https://huggingface.co/Snowflake/snowflake-arctic-embed-m-v1.5 (can use this or any other sentence transformer model instead of finetuned version, just replace model path)
