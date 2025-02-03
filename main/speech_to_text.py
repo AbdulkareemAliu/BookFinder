@@ -32,7 +32,7 @@ class SpeechHandler:
                 if self.recognizer.AcceptWaveform(data):
                     result = json.loads(self.recognizer.Result())
                     self.transcribed_text.append(result.get("text", ""))
-                    
+
                     print("Recorded:", result.get("text", "").strip())
 
     def toggle_listening(self):
