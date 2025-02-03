@@ -16,4 +16,4 @@ These methods can also be combined to further reduce the search space. This is d
 The embedding model was finetuned using this dataset https://www.kaggle.com/datasets/elvinrustam/books-dataset and randomly generated queries (details in main/finetune_embedding_model)
 
 ### Query system
-main/book_search.py is a script that allows you to make queries through the terminal and main/main.py allows you to make queries with speech. Both systems allow you to specify the method you would like to make searches with as well as the minimum similarity threshold needed in your results.
+main/book_search.py is a script that allows you to make queries through the terminal and main/main.py allows you to make queries with speech. Both systems allow you to specify the method you would like to make searches, the minimum similarity threshold needed in your results, and the maximum number of results to return.

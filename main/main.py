@@ -9,6 +9,7 @@ if __name__ == '__main__':
         'fts', 'embedding_naive', 'embedding_cluster', 'embedding_lsh', 'embedding_cluster_lsh'
     ], default='embedding_naive')
     parser.add_argument('--similarity_threshold', default=0.3)
+    parser.add_argument('--max_num_results', default=5)
     parser.add_argument('--quantize_embedding', action='store_true')
     args = parser.parse_args()
 
@@ -16,7 +17,8 @@ if __name__ == '__main__':
     search_handler = BookSearchHandler(
         search_method=args.method,
         quantize_embeddings=args.quantize_embedding,
-        similarity_threshold=float(args.similarity_threshold)
+        similarity_threshold=float(args.similarity_threshold),
+        max_num_results=int(args.max_num_results)
     )
     num_queries = 0
     while num_queries < 3:

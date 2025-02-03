@@ -14,6 +14,7 @@ class BookSearchHandler:
             search_method: str = "embedding_naive",
             quantize_embeddings: bool = False,
             similarity_threshold: float = 0.3,
+            max_num_results: int = 5,
             books_db_path: str="../books-database/books.db",
             embedding_model_path: str="../models/finetuned-snowflake-arctic-embed-m-v1.5",
             model_cache_path: str="./models/cache"
@@ -23,6 +24,7 @@ class BookSearchHandler:
         self.embedding_model = SentenceTransformer(embedding_model_path, cache_folder=model_cache_path)
 
         self.threshold = similarity_threshold
+        self.k = max_num_results
         self.quantize_embeddings = quantize_embeddings
         if quantize_embeddings:
             self.calibration_embeddings = get_calibration_embeddings(self.cursor)
@@ -64,7 +66,7 @@ class BookSearchHandler:
 
         scores = query_embedding @ embeddings.T
         above_threshold_indices = np.where(scores >= self.threshold)[0]
-        k = min(5, len(above_threshold_indices))
+        k = min(self.k, len(above_threshold_indices))
 
         above_threshold_scores = scores[above_threshold_indices]
         top_k_indices = np.argpartition(above_threshold_scores, -k)[-k:]
@@ -168,6 +170,7 @@ if __name__ == '__main__':
         'fts', 'embedding_naive', 'embedding_cluster', 'embedding_lsh', 'embedding_cluster_lsh'
     ], default='embedding_naive')
     parser.add_argument('--similarity_threshold', default=0.3)
+    parser.add_argument('--max_num_results', default=5)
     parser.add_argument('--quantize_embedding', action='store_true')
 
     args = parser.parse_args()
@@ -175,7 +178,8 @@ if __name__ == '__main__':
     search_handler = BookSearchHandler(
         search_method=args.method,
         quantize_embeddings=args.quantize_embedding,
-        similarity_threshold=float(args.similarity_threshold)
+        similarity_threshold=float(args.similarity_threshold),
+        max_num_results=int(args.max_num_results)
     )
 
     result = search_handler.book_search(args.query)
